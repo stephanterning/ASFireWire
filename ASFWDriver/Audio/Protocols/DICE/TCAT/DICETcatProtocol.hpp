@@ -11,6 +11,7 @@
 #include "../Core/DiceFamilyDriver.hpp"
 #include "../Core/DiceNotificationMailbox.hpp"
 #include "../Core/DiceNotificationRouter.hpp"
+#include "../Core/DiceRateFormats.hpp"
 #include "../Core/DiceWaitClock.hpp"
 #include "../Core/DICETransaction.hpp"
 #include "../Core/DICETypes.hpp"
@@ -41,6 +42,7 @@ struct DiceStartupMixerCell final {
 };
 
 struct DICETcatRuntimePolicy final {
+    DiceRateFormatFallback rateFormatFallback{nullptr};
     bool exposeDeviceToHostToCoreAudio{true};
     // Receiver-register dumps through the firmware loader's PEEK. Set only by
     // a protocol whose firmware TEST_ACTION table was verified (DICEBringupPolicy).

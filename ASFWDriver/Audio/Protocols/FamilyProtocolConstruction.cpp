@@ -6,6 +6,7 @@
 #include "FamilyProtocolConstruction.hpp"
 #include "GenericAvcProtocol.hpp"
 
+#include "DICE/AllenHeath/ZedR16RateFormats.hpp"
 #include "DICE/Avid/AvidMboxProRouting.hpp"
 #include "DICE/Focusrite/SPro24DspProtocol.hpp"
 #include "DICE/TCAT/DICETcatProtocol.hpp"
@@ -124,7 +125,9 @@ std::unique_ptr<IDeviceProtocol> CreateFamilyDeviceProtocol(
             return std::make_unique<DICE::TCAT::DICETcatProtocol>(
                 busOps, busInfo, routeRegistry, route, irmClient,
                 DICE::DriverKitWaitClock::Shared(), diceNotifications,
-                DICE::TCAT::DICETcatRuntimePolicy{}, timerScheduler);
+                DICE::TCAT::DICETcatRuntimePolicy{
+                    .rateFormatFallback = DICE::AllenHeath::ZedR16FormatFallback(route.guid),
+                }, timerScheduler);
 
         // Weiss is the one DICE device with a non-default runtime policy: it is
         // a one-way interface, so CoreAudio must not be shown the device->host

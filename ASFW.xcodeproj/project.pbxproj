@@ -843,6 +843,7 @@
 		327B8204F97F18D01DAC98E3 /* LogRing.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = LogRing.hpp; sourceTree = "<group>"; };
 		3287F0F488601696A613BF7E /* BeBoBProtocol.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = BeBoBProtocol.cpp; sourceTree = "<group>"; };
 		32CC29E09230667E7F45FE30 /* SpeedMapService.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = SpeedMapService.hpp; sourceTree = "<group>"; };
+		32D8D0A69938B7F057EFC12E /* ZedR16RateFormats.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = ZedR16RateFormats.hpp; sourceTree = "<group>"; };
 		33B240476E6D888462326806 /* DiceNotificationRouter.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = DiceNotificationRouter.hpp; sourceTree = "<group>"; };
 		33CC3FB7AA2E01ED66277C9B /* AsyncSubsystem.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = AsyncSubsystem.hpp; sourceTree = "<group>"; };
 		33EB223AE933093CF1ADC898 /* SpectrumFFTLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpectrumFFTLayout.swift; sourceTree = "<group>"; };
@@ -2521,6 +2522,7 @@
 		4D2DB64009F93C974F2DF20F /* DICE */ = {
 			isa = PBXGroup;
 			children = (
+				EAD18F6F0A40B3F8A9F5609C /* AllenHeath */,
 				36E42926D287F9AE213C0863 /* Avid */,
 				601AA648247AF33963C7C0E1 /* Core */,
 				53F2273AB44D0AB0B8448001 /* Focusrite */,
@@ -4034,6 +4036,14 @@
 				85B69CE2CBFC8EC9EA8A2B13 /* BeBoBBootloaderPreparationCoordinator.hpp */,
 			);
 			path = Bootloader;
+			sourceTree = "<group>";
+		};
+		EAD18F6F0A40B3F8A9F5609C /* AllenHeath */ = {
+			isa = PBXGroup;
+			children = (
+				32D8D0A69938B7F057EFC12E /* ZedR16RateFormats.hpp */,
+			);
+			path = AllenHeath;
 			sourceTree = "<group>";
 		};
 		EFF220506953EAF2FCEEB3DA /* Products */ = {

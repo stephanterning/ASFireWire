@@ -19,6 +19,7 @@ struct DiceModeFormat {
     std::vector<Runtime::RateWireStream> capture;
 };
 using DiceRateFormats = std::array<std::optional<DiceModeFormat>, 3>;
+using DiceRateFormatFallback = std::optional<DiceRateFormats> (*)(const AudioStreamRuntimeCaps&);
 
 [[nodiscard]] inline AudioStreamRuntimeCaps MakeDiceRuntimeCaps(
     const GlobalState& global, const StreamConfig& tx, const StreamConfig& rx,
@@ -80,11 +81,16 @@ DiceObservedFormat(const AudioStreamRuntimeCaps& caps) {
 /// The per-mode formats a device publishes. When the EAP read succeeded its
 /// formats stand for every mode and the stream registers are not consulted
 /// (Linux dice-stream.c:618-621): registers read before a clock select can
-/// describe another mode (:635-643). Without EAP only the observed mode is
+/// describe another mode (:635-643). Without EAP or a device fallback only the observed mode is
 /// known (Linux's fallback); no clock probing, no guessed scaling.
 [[nodiscard]] inline DiceRateFormats SelectPublishedFormats(bool eapRead, DiceRateFormats eap,
-                                                            const AudioStreamRuntimeCaps& caps) {
+                                                            const AudioStreamRuntimeCaps& caps,
+                                                            DiceRateFormatFallback fallback = nullptr) {
     if (eapRead) return eap;
+    if (fallback) {
+        if (auto formats = fallback(caps))
+            return std::move(*formats);
+    }
     DiceRateFormats observedOnly{};
     const auto mode = DiceRateMode(caps.sampleRateHz);
     const auto observed = DiceObservedFormat(caps);
