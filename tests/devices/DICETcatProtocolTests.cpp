@@ -10,6 +10,11 @@
 #include "Audio/Protocols/DICE/TCAT/DICETcatProtocol.hpp"
 #include "FakeDiceWaitClock.hpp"
 #include "FakeTimerScheduler.hpp"
+#include "Audio/Controls/ControlNotifications.hpp"
+#include "Audio/Model/Topology/Validate.hpp"
+#include "UserClient/WireFormats/ControlSnapshotDocument.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 #include <array>
 #include <cstdint>
@@ -146,7 +151,7 @@ std::array<uint8_t, kGlobalReadBytes> MakeGlobalStateWire(uint32_t clockSelect,
     PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kExtStatus, extStatus);
     PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kSampleRate, sampleRate);
     PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kVersion, 0x01000C00U);
-    PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kClockCaps, 0x00001E06U);
+    PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kClockCaps, 0x10201E06U);
     return bytes;
 }
 
@@ -189,10 +194,20 @@ public:
         } else if (address.addressHi == 0xFFFFU && address.addressLo == kGlobalBaseLo &&
                    length >= kGlobalReadBytes) {
             ++globalReadCount;
+            if (failClockRead) { callback(AsyncStatus::kTimeout, {}); return NextHandle(); }
             auto bytes = MakeGlobalStateWire(clockSelect_, status_, extStatus_, sampleRate_, notification_);
             ASFW::FW::WriteBE64(bytes.data(), owner_);
+            PutBe32(bytes.data() + ASFW::Audio::DICE::GlobalOffset::kClockCaps, clockCaps);
             payload.assign(bytes.begin(), bytes.end());
             payload.resize(length, 0);
+            if (holdGlobalRead) {
+                heldGlobalRead = std::move(callback);
+                heldGlobalPayload = payload;
+                return NextHandle();
+            }
+        } else if (address.addressLo == kGlobalBaseLo + ASFW::Audio::DICE::GlobalOffset::kClockSelect) {
+            if (failClockRead) { callback(AsyncStatus::kTimeout, {}); return NextHandle(); }
+            PutBe32(payload.data(), clockSelect_);
         } else if (address.addressHi == 0xFFFFU && address.addressLo == kExtensionBaseLo &&
             length >= ExtensionSections::kWireSize) {
             ++extensionReadCount;
@@ -248,6 +263,12 @@ public:
         (void)data;
         (void)speed;
         ++writeCount;
+        if (address.addressLo == kGlobalBaseLo + ASFW::Audio::DICE::GlobalOffset::kClockSelect) {
+            if (failClockWrite) { callback(AsyncStatus::kTimeout, {}); return NextHandle(); }
+            if (!ignoreClockWrite) clockSelect_ = ASFW::FW::ReadBE32(data.data());
+            if (failClockReadback) failClockRead = true;
+            if (holdClockWrite) { heldClockWrite = std::move(callback); return NextHandle(); }
+        }
         callback(AsyncStatus::kSuccess, {});
         return NextHandle();
     }
@@ -315,6 +336,16 @@ public:
     bool failS400GeneralRead{false};
     bool failS200GeneralRead{false};
     bool failS100GeneralRead{false};
+    bool holdGlobalRead{false};
+    ASFW::Async::InterfaceCompletionCallback heldGlobalRead;
+    std::vector<uint8_t> heldGlobalPayload;
+    bool ignoreClockWrite{false};
+    bool failClockReadback{false};
+    uint32_t clockCaps{0x10201E06U};
+    bool failClockRead{false};
+    bool failClockWrite{false};
+    bool holdClockWrite{false};
+    ASFW::Async::InterfaceCompletionCallback heldClockWrite;
     ASFW::Discovery::DeviceRegistry* invalidateRouteOnReadFailure{nullptr};
     std::vector<FwSpeed> generalReadSpeeds;
     uint32_t clockSelect_{kClockSelect48kInternal};
@@ -947,4 +978,256 @@ TEST(DICETcatProtocolTests, RateObservationUsesFreshClockAndRejectsUnconfirmedSe
     EXPECT_FALSE(observe().clockConfirmed);
     EXPECT_EQ(bus.writeCount, 0);
     EXPECT_EQ(bus.lockCount, 0);
+}
+
+class DiceClockControlTests : public ::testing::Test {
+protected:
+    CountingFireWireBus bus;
+    RouteState route;
+    DICETcatProtocol protocol{bus, bus, route.registry, route.route, nullptr, WaitClock(), nullptr,
+        {.clockSourceControl = true}};
+    void SetUp() override {
+        ASSERT_EQ(protocol.Initialize(), kIOReturnSuccess);
+        ASSERT_EQ(protocol.LoadGeometry(), kIOReturnSuccess);
+        ASSERT_NE(protocol.Controls(), nullptr);
+        std::optional<IOReturn> prepared;
+        protocol.Controls()->Prepare([&](auto status) { prepared = status; });
+        ASSERT_EQ(prepared, kIOReturnSuccess);
+    }
+    IOReturn Select(int64_t source) {
+        std::optional<IOReturn> result;
+        protocol.Controls()->SetParameter(ASFW::AudioModel::ParameterId{1}, source,
+            [&](auto status, auto confirmed) {
+                result = status;
+                if (status == kIOReturnSuccess) EXPECT_EQ(std::get<int64_t>(confirmed), source);
+            });
+        EXPECT_TRUE(result);
+        return result.value_or(kIOReturnTimeout);
+    }
+    int64_t Selected() {
+        return std::get<int64_t>(protocol.Controls()->CopySnapshot()->state.parameters.at(
+            ASFW::AudioModel::ParameterId{1}).value);
+    }
+};
+
+TEST_F(DiceClockControlTests, SelectionPreservesRateAndRequiresReadbackButNotLock) {
+    bus.clockSelect_ = 0x40c; // 96 kHz Internal; stale external measurement is irrelevant.
+    bus.status_ = 0;
+    bus.sampleRate_ = 48046;
+    const auto writes = bus.writeCount, locks = bus.lockCount, reads = bus.readCount;
+    ASSERT_EQ(Select(5), kIOReturnSuccess);
+    EXPECT_EQ(bus.clockSelect_, 0x405U);
+    EXPECT_EQ(Selected(), 5);
+    EXPECT_EQ(bus.writeCount, writes + 1);
+    EXPECT_EQ(bus.readCount, reads + 2);
+    EXPECT_EQ(bus.lockCount, locks); // no owner/stream reconfiguration
+    ASSERT_EQ(Select(12), kIOReturnSuccess);
+    EXPECT_EQ(bus.clockSelect_, 0x40cU);
+    EXPECT_EQ(bus.status_, 0U);
+}
+
+TEST_F(DiceClockControlTests, FailedReadDoesNotWriteAndFailedWriteDoesNotRollBack) {
+    const auto writes = bus.writeCount;
+    bus.failClockRead = true;
+    EXPECT_EQ(Select(5), kIOReturnTimeout);
+    EXPECT_EQ(bus.writeCount, writes);
+    bus.failClockRead = false;
+    bus.failClockWrite = true;
+    EXPECT_EQ(Select(5), kIOReturnTimeout);
+    EXPECT_EQ(bus.writeCount, writes + 1);
+    EXPECT_TRUE(protocol.Controls()->CopySnapshot()->state.parameters.empty());
+    bus.failClockWrite = false;
+    EXPECT_EQ(Select(5), kIOReturnSuccess); // no persistent unavailable latch
+}
+
+TEST_F(DiceClockControlTests, PendingSourceWriteSerializesRateAndOtherSourceWrites) {
+    bus.holdClockWrite = true;
+    std::optional<IOReturn> result;
+    protocol.Controls()->SetParameter(ASFW::AudioModel::ParameterId{1}, int64_t{5},
+        [&](auto status, auto) { result = status; });
+    ASSERT_FALSE(result);
+    const auto writes = bus.writeCount;
+    EXPECT_EQ(Select(12), kIOReturnBusy);
+    std::optional<IOReturn> initial;
+    protocol.EnsureRuntimeStreamGeometry([&](auto status) { initial = status; });
+    EXPECT_EQ(initial, kIOReturnBusy);
+    ASFW::Audio::AudioStreamRuntimeCaps caps;
+    EXPECT_TRUE(protocol.GetRuntimeAudioStreamCaps(caps));
+    const auto rate = protocol.ApplyClockIdle({48000});
+    ASSERT_FALSE(rate);
+    EXPECT_EQ(rate.error(), kIOReturnBusy);
+    EXPECT_EQ(bus.writeCount, writes);
+    auto complete = std::move(bus.heldClockWrite);
+    complete(AsyncStatus::kSuccess, {});
+    EXPECT_EQ(result, kIOReturnSuccess);
+    EXPECT_EQ(Selected(), 5);
+    bus.holdClockWrite = false;
+    EXPECT_EQ(Select(12), kIOReturnSuccess); // completion may remain owned by the bus
+}
+
+TEST_F(DiceClockControlTests, ResetDuringWriteUsesExistingStaleRouteFailure) {
+    bus.holdClockWrite = true;
+    std::optional<IOReturn> result;
+    protocol.Controls()->SetParameter(ASFW::AudioModel::ParameterId{1}, int64_t{5},
+        [&](auto status, auto) { result = status; });
+    route.registry.InvalidateLiveMappingsForBusReset();
+    auto complete = std::move(bus.heldClockWrite);
+    complete(AsyncStatus::kSuccess, {});
+    EXPECT_EQ(result, kIOReturnOffline);
+    EXPECT_FALSE(protocol.Controls()->CopySnapshot());
+}
+
+TEST_F(DiceClockControlTests, ShutdownDuringWriteDoesNotPublishOrDereferenceRetiredState) {
+    bus.holdClockWrite = true;
+    std::optional<IOReturn> result;
+    protocol.Controls()->SetParameter(ASFW::AudioModel::ParameterId{1}, int64_t{5},
+        [&](auto status, auto) { result = status; });
+    ASSERT_EQ(protocol.Shutdown(), kIOReturnSuccess);
+    auto complete = std::move(bus.heldClockWrite);
+    complete(AsyncStatus::kSuccess, {});
+    EXPECT_EQ(result, kIOReturnAborted);
+}
+
+TEST_F(DiceClockControlTests, OtherDevicesDoNotAcquireTheNewControl) {
+    DICETcatProtocol other(bus, bus, route.registry, route.route, nullptr, WaitClock(), nullptr);
+    EXPECT_EQ(other.Controls(), nullptr);
+    const auto writes = bus.writeCount;
+    EXPECT_EQ(Select(9), kIOReturnBadArgument);
+    EXPECT_EQ(bus.writeCount, writes);
+}
+
+TEST_F(DiceClockControlTests, ReconnectPreservesAdatAndConfiguredRateWithStaleMeasurement) {
+    bus.clockSelect_ = 0x205;
+    bus.status_ = ASFW::Audio::DICE::ClockRateIndex::k96000 << ASFW::Audio::DICE::StatusBits::kNominalRateShift;
+    bus.sampleRate_ = 96093;
+    std::optional<IOReturn> prepared;
+    protocol.EnsureRuntimeStreamGeometry([&](auto status) { prepared = status; });
+    static_cast<ASFW::Testing::FakeTimerScheduler*>(WaitClock().Scheduler())->Advance(550'000'000ULL);
+    ASSERT_EQ(prepared, kIOReturnSuccess);
+    EXPECT_EQ(bus.clockSelect_, 0x205U);
+    EXPECT_EQ(Selected(), 5);
+    ASFW::Audio::AudioStreamRuntimeCaps caps;
+    ASSERT_TRUE(protocol.GetRuntimeAudioStreamCaps(caps));
+    EXPECT_EQ(caps.sampleRateHz, 48000U);
+    bool observed = false;
+    protocol.ReadRateObservation([&](auto status, auto observation) {
+        EXPECT_EQ(status, kIOReturnSuccess);
+        EXPECT_TRUE(observation.clockConfirmed);
+        EXPECT_EQ(observation.caps.sampleRateHz, 48000U);
+        observed = true;
+    });
+    EXPECT_TRUE(observed);
+    EXPECT_EQ(Select(12), kIOReturnSuccess); // initial preparation released the shared register
+}
+
+TEST_F(DiceClockControlTests, ConfirmedSourceIsIndependentOfLockAndMeasurement) {
+    namespace AM = ASFW::AudioModel;
+    bus.status_ = 0;
+    bus.sampleRate_ = 47906;
+    ASSERT_EQ(Select(5), kIOReturnSuccess);
+    const auto snapshot = *protocol.Controls()->CopySnapshot();
+    ASSERT_TRUE(AM::validate(snapshot.topology));
+    ASSERT_TRUE(AM::validateState(snapshot.topology, snapshot.state));
+    ASSERT_EQ(snapshot.topology.parameters.size(), 3U);
+    EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{1}).value), 5);
+    EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{2}).value), 0);
+    EXPECT_EQ(std::get<double>(snapshot.state.parameters.at(AM::ParameterId{3}).value), 47906);
+    for (uint32_t id : {2U, 3U}) {
+        std::optional<IOReturn> result;
+        protocol.Controls()->SetParameter(AM::ParameterId{id}, int64_t{1},
+            [&](auto status, auto) { result = status; });
+        EXPECT_EQ(result, kIOReturnNotWritable);
+        EXPECT_EQ(snapshot.topology.parameters[id - 1].access, AM::ParameterAccess::ReadOnly);
+    }
+    const auto document = ASFW::UserClient::Wire::BuildControlSnapshotDocument(
+        0x0004c404000186a1ULL, snapshot.family, snapshot.topology, snapshot.state, snapshot.sequence);
+    if (const char* path = std::getenv("ASFW_DUMP_ZED_CONTROLS")) {
+        if (FILE* out = std::fopen(path, "w")) { std::fputs(document.c_str(), out); std::fclose(out); }
+    }
+}
+
+TEST_F(DiceClockControlTests, SuccessfulWriteWithUnchangedReadbackIsNotConfirmed) {
+    bus.ignoreClockWrite = true;
+    EXPECT_EQ(Select(5), kIOReturnError);
+    EXPECT_TRUE(protocol.Controls()->CopySnapshot()->state.parameters.empty());
+    bus.ignoreClockWrite = false;
+    EXPECT_EQ(Select(5), kIOReturnSuccess);
+}
+
+TEST_F(DiceClockControlTests, UnreadableWriteResultIsUnknownAndDoesNotRollBack) {
+    bus.failClockReadback = true;
+    const auto writes = bus.writeCount;
+    EXPECT_EQ(Select(5), kIOReturnTimeout);
+    EXPECT_EQ(bus.clockSelect_, 0x205U);
+    EXPECT_EQ(bus.writeCount, writes + 1);
+    EXPECT_TRUE(protocol.Controls()->CopySnapshot()->state.parameters.empty());
+    bus.failClockReadback = bus.failClockRead = false;
+    protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnSuccess); });
+    EXPECT_EQ(Selected(), 5);
+}
+
+TEST_F(DiceClockControlTests, MissingAdatCapabilityRefusesWithoutWriting) {
+    bus.clockCaps = 0x1000001e;
+    const auto writes = bus.writeCount;
+    EXPECT_EQ(Select(5), kIOReturnUnsupported);
+    EXPECT_EQ(bus.writeCount, writes);
+    protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnSuccess); });
+    const auto snapshot = *protocol.Controls()->CopySnapshot();
+    const auto& choices = std::get<ASFW::AudioModel::EnumDomain>(snapshot.topology.parameters.front().domain).values;
+    ASSERT_EQ(choices.size(), 1U);
+    EXPECT_EQ(choices[0].name, "Internal");
+}
+
+TEST_F(DiceClockControlTests, HealthObservationPushesLockLossAndClearsUnreadableValues) {
+    namespace C = ASFW::Audio::Controls;
+    namespace AM = ASFW::AudioModel;
+    std::vector<C::ParameterChanged> events;
+    ASSERT_TRUE(C::ControlNotifications::Shared().Register(&events, [](void* context, const auto& event) {
+        static_cast<std::vector<C::ParameterChanged>*>(context)->push_back(event);
+    }));
+    bus.status_ = 0;
+    bus.sampleRate_ = 96093;
+    protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnSuccess); });
+    auto snapshot = *protocol.Controls()->CopySnapshot();
+    EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{2}).value), 0);
+    EXPECT_EQ(std::get<double>(snapshot.state.parameters.at(AM::ParameterId{3}).value), 96093);
+    EXPECT_EQ(events.size(), 1U);
+    if (!events.empty()) {
+        EXPECT_EQ(events.back().kind, 4U);
+        EXPECT_EQ(events.back().sequence, snapshot.sequence);
+    }
+    protocol.ReadDuplexHealth([](auto, auto) {});
+    EXPECT_EQ(events.size(), 1U); // no duplicate invalidation for unchanged state
+    bus.failClockRead = true;
+    protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnTimeout); });
+    EXPECT_TRUE(protocol.Controls()->CopySnapshot()->state.parameters.empty());
+    bus.failClockRead = false;
+    bus.status_ = kLocked48kStatus;
+    protocol.ReadDuplexHealth([](auto, auto) {});
+    snapshot = *protocol.Controls()->CopySnapshot();
+    EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{2}).value), 1);
+    C::ControlNotifications::Shared().Unregister(&events);
+}
+
+TEST_F(DiceClockControlTests, OldHealthReadCannotOverwriteNewSourceReadback) {
+    bus.holdGlobalRead = true;
+    protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnSuccess); });
+    ASSERT_TRUE(bus.heldGlobalRead);
+    bus.holdGlobalRead = false;
+    ASSERT_EQ(Select(5), kIOReturnSuccess);
+    const auto sequence = protocol.Controls()->CopySnapshot()->sequence;
+    auto complete = std::move(bus.heldGlobalRead);
+    complete(AsyncStatus::kSuccess, bus.heldGlobalPayload);
+    EXPECT_EQ(Selected(), 5);
+    EXPECT_EQ(protocol.Controls()->CopySnapshot()->sequence, sequence);
+}
+
+TEST_F(DiceClockControlTests, RateApplyReadsLiveSourceAfterUncertainControlWrite) {
+    bus.failClockReadback = true;
+    ASSERT_EQ(Select(5), kIOReturnTimeout);
+    bus.failClockReadback = bus.failClockRead = false;
+    // The previous source is unknown to the UI. A later rate change must read
+    // CLOCK_SELECT, not fall back to Internal or a remembered requested value.
+    (void)protocol.ApplyClockIdle({48000});
+    EXPECT_EQ(bus.clockSelect_ & 0xffU, 5U);
 }

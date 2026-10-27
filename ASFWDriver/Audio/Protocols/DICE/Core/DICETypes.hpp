@@ -626,7 +626,32 @@ inline constexpr uint32_t kDiceRateCapsMask = 0x7F;
 // telemetry instead of an admission gate.
 class DiceClockChangeObserver;
 
+[[nodiscard]] inline bool IsExternalClockSelection(uint32_t selection, bool allowExternal) noexcept {
+    return allowExternal && (selection & ClockSelect::kSourceMask) == static_cast<uint32_t>(ClockSource::ADAT);
+}
+
+// Linux dice-transaction.c:75-93 uses CLOCK_SELECT for the PCM rate. The
+// external frequency counter can drift, or retain its last value without lock.
+[[nodiscard]] inline uint32_t DiceConfiguredRate(uint32_t measured, uint32_t status,
+                                                uint32_t selection, bool allowExternal) noexcept {
+    if (!IsExternalClockSelection(selection, allowExternal)) return measured;
+    const auto index = (selection & ClockSelect::kRateMask) >> ClockSelect::kRateShift;
+    for (const auto& rate : kDiceRateTable) {
+        if (rate.rateIndex == index)
+            return !IsSourceLocked(status) || NominalRateHz(status) == rate.hz ? rate.hz : 0;
+    }
+    return 0;
+}
+
+[[nodiscard]] inline bool DiceClockAtRate(uint32_t measured, uint32_t status, uint32_t selection,
+                                         uint32_t rate, bool allowExternal) noexcept {
+    return DiceConfiguredRate(measured, status, selection, allowExternal) == rate &&
+        (NominalRateHz(status) == rate ||
+         (IsExternalClockSelection(selection, allowExternal) && !IsSourceLocked(status)));
+}
+
 struct DICEBringupPolicy final {
+    bool allowExternalClock{false};
     bool requireSourceLockBeforeStreamEnable{true};
     bool requireSourceLockAtConfirm{true};
 
@@ -648,17 +673,16 @@ constexpr uint32_t kDiceClockSelect48kInternal =
     (ClockRateIndex::k48000 << ClockSelect::kRateShift) |
     static_cast<uint32_t>(ClockSource::Internal);
 
-/// A configuration is supported when the source is Internal (bring-up policy:
-/// device is its own clock master), the rate is in the standard table and
+/// A configuration is supported when the source is enabled, the rate is in the standard table and
 /// within the HW-validated ceiling, and the CLOCK_SELECT rate index encodes
 /// that same rate. Generalizes the former 48k-internal-only placeholder.
 [[nodiscard]] inline bool IsSupportedDiceClockConfiguration(
-    const DiceClockConfiguration& clock, bool allowMultirate = false) noexcept {
+    const DiceClockConfiguration& clock, bool allowMultirate = false, bool allowExternal = false) noexcept {
     if (!allowMultirate && !DiceRateIsStreamable(clock.sampleRateHz)) {
         return false;
     }
     if ((clock.clockSelect & ClockSelect::kSourceMask) !=
-        static_cast<uint32_t>(ClockSource::Internal)) {
+        static_cast<uint32_t>(ClockSource::Internal) && !IsExternalClockSelection(clock.clockSelect, allowExternal)) {
         return false;
     }
     for (const auto& e : kDiceRateTable) {

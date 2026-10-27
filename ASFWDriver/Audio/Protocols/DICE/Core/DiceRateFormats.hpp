@@ -23,13 +23,13 @@ using DiceRateFormats = std::array<std::optional<DiceModeFormat>, 3>;
 
 [[nodiscard]] inline AudioStreamRuntimeCaps MakeDiceRuntimeCaps(
     const GlobalState& global, const StreamConfig& tx, const StreamConfig& rx,
-    bool exposeCapture) {
+    bool exposeCapture, bool allowExternal = false) {
     AudioStreamRuntimeCaps caps{
         .hostInputPcmChannels = exposeCapture ? tx.TotalPcmChannels() : 0,
         .hostOutputPcmChannels = rx.TotalPcmChannels(),
         .deviceToHostAm824Slots = tx.TotalAm824Slots(),
         .hostToDeviceAm824Slots = rx.TotalAm824Slots(),
-        .sampleRateHz = global.sampleRate,
+        .sampleRateHz = DiceConfiguredRate(global.sampleRate, global.status, global.clockSelect, allowExternal),
         .deviceRateMask = DiceDeviceRateMask(global.hasClockCaps, global.clockCaps),
         .deviceToHostIsoChannel = tx.FirstActiveIsoChannel(AudioStreamRuntimeCaps::kInvalidIsoChannel),
         .hostToDeviceIsoChannel = rx.FirstActiveIsoChannel(AudioStreamRuntimeCaps::kInvalidIsoChannel),

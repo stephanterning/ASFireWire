@@ -94,6 +94,7 @@ struct DuplexHealthResult {
     AudioStreamRuntimeCaps runtimeCaps{};
     bool sourceLocked{false};
     bool clockReferenceHealthy{true};
+    bool canStreamWithoutSourceLock{false};
     uint32_t nominalRateHz{0};
     uint32_t notification{0};
     uint32_t status{0};

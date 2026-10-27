@@ -15,6 +15,7 @@
 #include "../Core/DICETransaction.hpp"
 #include "../Core/DICETypes.hpp"
 #include "../../IDeviceProtocol.hpp"
+#include "../../../Controls/IControlProvider.hpp"
 #include "../../../Runtime/ResolvedAudioConfiguration.hpp"
 #include "../../../../Protocols/Ports/ProtocolRegisterIO.hpp"
 #include "../../../../Scheduling/ITimerScheduler.hpp"
@@ -41,6 +42,8 @@ struct DiceStartupMixerCell final {
 };
 
 struct DICETcatRuntimePolicy final {
+    // Opt in only for hardware with verified Internal/ADAT behavior.
+    bool clockSourceControl{false};
     bool exposeDeviceToHostToCoreAudio{true};
     // Receiver-register dumps through the firmware loader's PEEK. Set only by
     // a protocol whose firmware TEST_ACTION table was verified (DICEBringupPolicy).
@@ -95,6 +98,7 @@ struct DICETcatRuntimePolicy final {
 
 class DICETcatProtocol final : public Audio::IDeviceProtocol,
                                public Audio::FamilyDriver,
+                               private Controls::IControlProvider,
                                private DiceClockChangeObserver {
 public:
     using VoidCallback = std::function<void(IOReturn)>;
@@ -117,6 +121,9 @@ public:
     IOReturn Shutdown() override;
     const char* GetName() const override { return "TCAT DICE"; }
     Audio::FamilyDriver* AsFamilyDriver() noexcept override { return this; }
+    Controls::IControlProvider* Controls() noexcept override {
+        return runtimePolicy_.clockSourceControl ? this : nullptr;
+    }
 
     bool GetRuntimeAudioStreamCaps(AudioStreamRuntimeCaps& outCaps) const override;
     std::shared_ptr<const std::vector<Runtime::RateFormation>> RateFormations() const override {
@@ -188,9 +195,31 @@ public:
 private:
     friend class DICETcatProtocolTestPeer;
 
+    void Prepare(VoidCallback done) override;
+    std::optional<Controls::ControlSnapshot> CopySnapshot() const override;
+    void SetParameter(AudioModel::ParameterId id, const AudioModel::ParameterValue& value,
+                      Controls::IControlProvider::Completion done) override;
+    void ObserveClock(IOReturn status, const GlobalState& global,
+                      const Discovery::DeviceRouteToken& route, uint64_t observation);
+    IOLock* controlsLock_{IOLockAlloc()};
+    std::optional<Controls::ControlSnapshot> controlSnapshot_;
+    std::atomic<uint64_t> controlObservation_{0};
+    std::atomic<bool> duplexPreparing_{false};
+    // Source and rate share CLOCK_SELECT. Serialize their read/modify/write,
+    // without waiting for source lock or changing the streaming lifecycle.
+    std::atomic_flag clockWriteBusy_{};
+    struct ClockWriteScope {
+        std::atomic_flag& busy;
+        bool acquired;
+        explicit ClockWriteScope(std::atomic_flag& flag)
+            : busy(flag), acquired(!flag.test_and_set()) {}
+        void Release() { if (acquired) { acquired = false; busy.clear(); } }
+        ~ClockWriteScope() { Release(); }
+    };
+
     [[nodiscard]] static bool MakeDiceClockConfiguration(
         const AudioClockConfig& requested,
-        DiceClockConfiguration& out) noexcept;
+        DiceClockConfiguration& out, ClockSource source = ClockSource::Internal) noexcept;
     void EnsureSectionsLoaded(VoidCallback callback);
     void EnsureRuntimeCapsLoaded(VoidCallback callback);
     struct InitialClockPreparation;

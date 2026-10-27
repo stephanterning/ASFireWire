@@ -394,6 +394,7 @@ public:
         return DuplexHealthResult{.generation = Generation{1}, .appliedClock = clock_,
                                   .runtimeCaps = caps_, .sourceLocked = locked,
                                   .clockReferenceHealthy = true,
+                                  .canStreamWithoutSourceLock = canStreamWithoutSourceLock,
                                   .nominalRateHz = clock_.sampleRateHz,
                                   .status = statusValue};
     }
@@ -409,6 +410,7 @@ public:
 
     // Source-lock state of successive health reads.
     std::vector<bool> healthLocked;
+    bool canStreamWithoutSourceLock{false};
     ResourcePolicy resourcePolicy{};
     StopPolicy stopPolicy{};
     StartReadinessPolicy readinessPolicy{};
