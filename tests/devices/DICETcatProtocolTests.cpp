@@ -1128,17 +1128,14 @@ TEST_F(DiceClockControlTests, ConfirmedSourceIsIndependentOfLockAndMeasurement) 
     const auto snapshot = *protocol.Controls()->CopySnapshot();
     ASSERT_TRUE(AM::validate(snapshot.topology));
     ASSERT_TRUE(AM::validateState(snapshot.topology, snapshot.state));
-    ASSERT_EQ(snapshot.topology.parameters.size(), 3U);
+    ASSERT_EQ(snapshot.topology.parameters.size(), 2U);
     EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{1}).value), 5);
     EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{2}).value), 0);
-    EXPECT_EQ(std::get<double>(snapshot.state.parameters.at(AM::ParameterId{3}).value), 47906);
-    for (uint32_t id : {2U, 3U}) {
-        std::optional<IOReturn> result;
-        protocol.Controls()->SetParameter(AM::ParameterId{id}, int64_t{1},
-            [&](auto status, auto) { result = status; });
-        EXPECT_EQ(result, kIOReturnNotWritable);
-        EXPECT_EQ(snapshot.topology.parameters[id - 1].access, AM::ParameterAccess::ReadOnly);
-    }
+    std::optional<IOReturn> result;
+    protocol.Controls()->SetParameter(AM::ParameterId{2}, int64_t{1},
+        [&](auto status, auto) { result = status; });
+    EXPECT_EQ(result, kIOReturnNotWritable);
+    EXPECT_EQ(snapshot.topology.parameters[1].access, AM::ParameterAccess::ReadOnly);
     const auto document = ASFW::UserClient::Wire::BuildControlSnapshotDocument(
         0x0004c404000186a1ULL, snapshot.family, snapshot.topology, snapshot.state, snapshot.sequence);
     if (const char* path = std::getenv("ASFW_DUMP_ZED_CONTROLS")) {
@@ -1190,14 +1187,14 @@ TEST_F(DiceClockControlTests, HealthObservationPushesLockLossAndClearsUnreadable
     protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnSuccess); });
     auto snapshot = *protocol.Controls()->CopySnapshot();
     EXPECT_EQ(std::get<int64_t>(snapshot.state.parameters.at(AM::ParameterId{2}).value), 0);
-    EXPECT_EQ(std::get<double>(snapshot.state.parameters.at(AM::ParameterId{3}).value), 96093);
     EXPECT_EQ(events.size(), 1U);
     if (!events.empty()) {
         EXPECT_EQ(events.back().kind, 4U);
         EXPECT_EQ(events.back().sequence, snapshot.sequence);
     }
+    bus.sampleRate_ = 47906; // frequency-only changes are not Device Controls changes
     protocol.ReadDuplexHealth([](auto, auto) {});
-    EXPECT_EQ(events.size(), 1U); // no duplicate invalidation for unchanged state
+    EXPECT_EQ(events.size(), 1U); // source and lock are unchanged
     bus.failClockRead = true;
     protocol.ReadDuplexHealth([](auto status, auto) { EXPECT_EQ(status, kIOReturnTimeout); });
     EXPECT_TRUE(protocol.Controls()->CopySnapshot()->state.parameters.empty());

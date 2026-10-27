@@ -508,9 +508,6 @@ void DICETcatProtocol::ObserveClock(IOReturn status, const GlobalState& global,
             std::move(sources), "Sync Source"},
         {AM::ParameterId{2}, AM::NodeId{1}, AM::ParameterSemantic::Unknown,
             AM::EnumDomain{{{0, "Unlocked"}, {1, "Locked"}}}, "System clock", AM::ParameterAccess::ReadOnly},
-        {AM::ParameterId{3}, AM::NodeId{1}, AM::ParameterSemantic::Unknown,
-            AM::ScalarDomain{0, double(UINT32_MAX), 1, AM::ScalarUnit::Hertz},
-            "Measured Sampling Rate", AM::ParameterAccess::ReadOnly},
     };
     if (status == kIOReturnSuccess) {
         const auto source = static_cast<ClockSource>(global.clockSelect & ClockSelect::kSourceMask);
@@ -519,7 +516,6 @@ void DICETcatProtocol::ObserveClock(IOReturn status, const GlobalState& global,
             next.state.parameters[AM::ParameterId{1}] = {int64_t(source)};
         }
         next.state.parameters[AM::ParameterId{2}] = {int64_t(IsSourceLocked(global.status))};
-        next.state.parameters[AM::ParameterId{3}] = {double(global.sampleRate)};
     }
     bool changed = !controlSnapshot_ || controlSnapshot_->topology.revision != route.routeEpoch ||
         controlSnapshot_->topology.parameters[0].domain != next.topology.parameters[0].domain ||
@@ -563,7 +559,7 @@ std::optional<Controls::ControlSnapshot> DICETcatProtocol::CopySnapshot() const 
 
 void DICETcatProtocol::SetParameter(AudioModel::ParameterId id, const AudioModel::ParameterValue& value,
                                    Controls::IControlProvider::Completion done) {
-    if (id.value == 2 || id.value == 3) { done(kIOReturnNotWritable, false); return; }
+    if (id.value == 2) { done(kIOReturnNotWritable, false); return; }
     const auto* source = std::get_if<int64_t>(&value);
     if (id.value != 1 || !source || (*source != int64_t(ClockSource::Internal) && *source != int64_t(ClockSource::ADAT))) {
         done(kIOReturnBadArgument, false); return;
