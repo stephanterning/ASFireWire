@@ -190,12 +190,3 @@ TEST(DiceSectionTable, EachBoundIsChecked) {
 }
 
 } // namespace
-
-TEST(DiceIdentity, ZedClockControlsMatchProductAndCategoryNotOtherAllenHeathDevices) {
-    using ASFW::DeviceProfiles::Audio::IsZedR16;
-    EXPECT_TRUE(IsZedR16(0x0004c404000186a1ULL));
-    EXPECT_TRUE(IsZedR16(0x0004c404003fffffULL));
-    EXPECT_FALSE(IsZedR16(0x0004c40400400000ULL));
-    EXPECT_FALSE(IsZedR16(0x0004c403000186a1ULL));
-    EXPECT_FALSE(IsZedR16(0x0004c504000186a1ULL));
-}

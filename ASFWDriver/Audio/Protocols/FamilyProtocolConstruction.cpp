@@ -17,7 +17,6 @@
 #include "RME/FirefaceDeviceProtocol.hpp"
 #include "Prism/Orpheus/OrpheusProtocol.hpp"
 #include "../../DeviceProfiles/Audio/AudioDeviceCatalog.hpp"
-#include "../../DeviceProfiles/Audio/DiceIdentity.hpp"
 #include "../../Logging/Logging.hpp"
 #include "../../Scheduling/ITimerScheduler.hpp"
 
@@ -125,9 +124,7 @@ std::unique_ptr<IDeviceProtocol> CreateFamilyDeviceProtocol(
             return std::make_unique<DICE::TCAT::DICETcatProtocol>(
                 busOps, busInfo, routeRegistry, route, irmClient,
                 DICE::DriverKitWaitClock::Shared(), diceNotifications,
-                DICE::TCAT::DICETcatRuntimePolicy{
-                    .clockSourceControl = DeviceProfiles::Audio::IsZedR16(route.guid),
-                }, timerScheduler);
+                DICE::TCAT::DICETcatRuntimePolicy{}, timerScheduler);
 
         // Weiss is the one DICE device with a non-default runtime policy: it is
         // a one-way interface, so CoreAudio must not be shown the device->host

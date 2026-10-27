@@ -747,15 +747,3 @@ TEST_F(ApogeeTest, StagedStopReportsDisconnectFailureAndRetainsReservations) {
 }
 
 } // namespace
-
-TEST_F(ApogeeTest, ExplicitFamilyCapabilityPermitsUnlockedStart) {
-    Device().healthLocked = {false};
-    Device().canStreamWithoutSourceLock = true;
-    ASSERT_EQ(rig.sessions.Attach(rig.guid), kIOReturnSuccess);
-    EXPECT_GT(Count("D health"), 0);
-}
-TEST_F(ApogeeTest, UnlockedStartWithoutFamilyCapabilityStillFails) {
-    Device().healthLocked = {false};
-    EXPECT_EQ(rig.sessions.Attach(rig.guid), kIOReturnTimeout);
-    EXPECT_EQ(Count("H start"), 0);
-}

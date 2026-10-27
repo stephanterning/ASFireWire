@@ -135,6 +135,7 @@ void DICETcatProtocol::PrepareInitialClock(VoidCallback callback) {
     CancelInitialClock();
     auto state = std::make_shared<InitialClockPreparation>(clockWriteBusy_);
     if (!state->clockWrite.acquired) { callback(kIOReturnBusy); return; }
+    ++controlObservation_;
     ResetRuntimeCaps();
     // A reset invalidates the live observation, not previously measured rate
     // layouts for this protocol instance. Shutdown clears the retained catalog.
@@ -168,11 +169,13 @@ void DICETcatProtocol::InitialClockOwner(const std::shared_ptr<InitialClockPrepa
         // geometry is needed to build the rate formations, including high rates.
         // Linux dice-stream.c:608-646 also reselects the current rate first.
         const uint32_t observedRate = DiceConfiguredRate(global.sampleRate, global.status,
-            global.clockSelect, runtimePolicy_.clockSourceControl);
+            global.clockSelect);
         const uint32_t rate = DiceRateMode(observedRate)
             ? observedRate : DiceInitialRate(DiceDeviceRateMask(global.hasClockCaps, global.clockCaps));
-        const auto source = runtimePolicy_.clockSourceControl
-            ? static_cast<ClockSource>(global.clockSelect & ClockSelect::kSourceMask) : ClockSource::Internal;
+        const auto source = static_cast<ClockSource>(global.clockSelect & ClockSelect::kSourceMask);
+        if (!IsSupportedDiceClockSource(static_cast<uint32_t>(source))) {
+            FinishInitialClock(state, kIOReturnUnsupported); return;
+        }
         uint32_t clockSelect = 0;
         if (!DiceClockSelectForRate(rate, source, clockSelect)) {
             FinishInitialClock(state, kIOReturnUnsupported); return;
@@ -313,10 +316,9 @@ void DICETcatProtocol::InitialClockPoll(const std::shared_ptr<InitialClockPrepar
         state->notifications |= (global.notification & ~state->priorGlobalNotifications) | late;
         const bool atTarget = global.clockSelect == state->clock.clockSelect &&
             DiceClockAtRate(global.sampleRate, global.status, global.clockSelect,
-                            state->clock.sampleRateHz, runtimePolicy_.clockSourceControl);
+                            state->clock.sampleRateHz);
         const bool ready = atTarget &&
-            (!runtimePolicy_.requireSourceLockBeforeStreamEnable || IsSourceLocked(global.status) ||
-             IsExternalClockSelection(global.clockSelect, runtimePolicy_.clockSourceControl));
+            (!runtimePolicy_.requireSourceLockBeforeStreamEnable || IsSourceLocked(global.status));
         if (!state->accepted && ((state->notifications & Notify::kClockAccepted) ||
                                 now - state->startedNs >= 150'000'000ULL)) {
             if (!(state->notifications & Notify::kClockAccepted)) {
@@ -343,7 +345,7 @@ void DICETcatProtocol::InitialClockPoll(const std::shared_ptr<InitialClockPrepar
 }
 
 bool DICETcatProtocol::MakeDiceClockConfiguration(
-    const AudioClockConfig& requested, DiceClockConfiguration& out, ClockSource source) noexcept {
+    const AudioClockConfig& requested, DiceClockConfiguration& out) noexcept {
     if (!IsSupportedAudioClockConfig(requested) &&
         !(Runtime::kDiceHardwareBatch && DiceRateMode(requested.sampleRateHz))) {
         return false;
@@ -351,9 +353,9 @@ bool DICETcatProtocol::MakeDiceClockConfiguration(
     // The DICE adapter owns the register encoding: Linux selects the requested
     // rate by updating GLOBAL_CLOCK_SELECT while preserving the source bits
     // (dice-stream.c:60-85; dice-interface.h:80-95). Encode the requested rate
-    // via the standard table, retaining the selected source.
+    // via the standard table; DiceFamilyDriver preserves the source at its pre-claim read.
     uint32_t clockSelect = 0;
-    if (!DiceClockSelectForRate(requested.sampleRateHz, source,
+    if (!DiceClockSelectForRate(requested.sampleRateHz, ClockSource::Internal,
                                 clockSelect)) {
         return false;
     }
@@ -402,7 +404,6 @@ IOReturn DICETcatProtocol::Initialize() {
     if (!driver_) {
         driver_.emplace(deviceIo_, busInfo_, notifications_,
                         DICEBringupPolicy{
-                            .allowExternalClock = runtimePolicy_.clockSourceControl,
                             .requireSourceLockBeforeStreamEnable =
                                 runtimePolicy_.requireSourceLockBeforeStreamEnable,
                             .requireSourceLockAtConfirm =
@@ -480,7 +481,7 @@ bool DICETcatProtocol::GetRuntimeAudioStreamCaps(AudioStreamRuntimeCaps& outCaps
 // carry a ticket: an older health read cannot overwrite a later source write.
 void DICETcatProtocol::ObserveClock(IOReturn status, const GlobalState& global,
                                    const Discovery::DeviceRouteToken& route, uint64_t observation) {
-    if (!runtimePolicy_.clockSourceControl || !initialized_ || !observation ||
+    if (!initialized_ || !observation ||
         route != io_.Route() || !io_.IsRouteCurrent()) return;
     namespace AM = AudioModel;
     auto& notifications = Controls::ControlNotifications::Shared();
@@ -564,7 +565,7 @@ void DICETcatProtocol::SetParameter(AudioModel::ParameterId id, const AudioModel
     if (id.value != 1 || !source || (*source != int64_t(ClockSource::Internal) && *source != int64_t(ClockSource::ADAT))) {
         done(kIOReturnBadArgument, false); return;
     }
-    if (!runtimePolicy_.clockSourceControl || !CopySnapshot()) { done(kIOReturnNotReady, false); return; }
+    if (!CopySnapshot()) { done(kIOReturnNotReady, false); return; }
     auto operation = std::make_shared<ClockWriteScope>(clockWriteBusy_);
     if (!operation->acquired || duplexPreparing_.load()) { done(kIOReturnBusy, false); return; }
     const auto requested = uint32_t(*source);
@@ -625,22 +626,21 @@ void DICETcatProtocol::ReadRateObservation(
             [this, observed, callback = std::move(callback)](IOReturn status, GlobalState after) mutable {
                 if (status != kIOReturnSuccess) { callback(status, {}); return; }
                 const auto observedRate = DiceConfiguredRate(observed.global.sampleRate, observed.global.status,
-                    observed.global.clockSelect, runtimePolicy_.clockSourceControl);
+                    observed.global.clockSelect);
                 const auto afterRate = DiceConfiguredRate(after.sampleRate, after.status,
-                    after.clockSelect, runtimePolicy_.clockSourceControl);
+                    after.clockSelect);
                 const bool stable = afterRate != 0 && afterRate == observedRate &&
                     after.clockSelect == observed.global.clockSelect &&
-                    DiceClockAtRate(after.sampleRate, after.status, after.clockSelect, afterRate, runtimePolicy_.clockSourceControl) &&
+                    DiceClockAtRate(after.sampleRate, after.status, after.clockSelect, afterRate) &&
                     std::ranges::any_of(kDiceRateTable, [&](const auto& rate) {
                         return rate.hz == afterRate && rate.rateIndex ==
                             ((after.clockSelect & ClockSelect::kRateMask) >> ClockSelect::kRateShift);
                     });
-                const bool locked = (!runtimePolicy_.requireSourceLockAtConfirm || IsSourceLocked(after.status) ||
-                    IsExternalClockSelection(after.clockSelect, runtimePolicy_.clockSourceControl)) &&
+                const bool locked = (!runtimePolicy_.requireSourceLockAtConfirm || IsSourceLocked(after.status)) &&
                     ((after.clockSelect & ClockSelect::kSourceMask) != static_cast<uint32_t>(ClockSource::ARX1) ||
                      (IsArx1Locked(after.extStatus) && !HasArx1Slip(after.extStatus)));
                 const auto caps = MakeDiceRuntimeCaps(after, observed.txStreams,
-                    observed.rxStreams, runtimePolicy_.exposeDeviceToHostToCoreAudio, runtimePolicy_.clockSourceControl);
+                    observed.rxStreams, runtimePolicy_.exposeDeviceToHostToCoreAudio);
                 if (stable && locked) {
                     const auto measured = DiceObservedRateFormation(caps,
                         runtimePolicy_.exposeDeviceToHostToCoreAudio);
@@ -697,14 +697,8 @@ std::expected<DuplexPrepareResult, IOReturn> DICETcatProtocol::Configure(
     ClockWriteScope clockWrite(clockWriteBusy_);
     if (!clockWrite.acquired) return std::unexpected(kIOReturnBusy);
     ++controlObservation_; // invalidate health reads begun before this clock transaction
-    auto source = ClockSource::Internal;
-    if (runtimePolicy_.clockSourceControl) {
-        const auto global = deviceIo_.ReadGlobalStateFull(sections_);
-        if (!global) return std::unexpected(global.error());
-        source = static_cast<ClockSource>(global->clockSelect & ClockSelect::kSourceMask);
-    }
     DiceClockConfiguration diceClock{};
-    if (!MakeDiceClockConfiguration(clock, diceClock, source)) {
+    if (!MakeDiceClockConfiguration(clock, diceClock)) {
         return std::unexpected(kIOReturnUnsupported);
     }
 
@@ -1113,14 +1107,8 @@ std::expected<DuplexClockApplyResult, IOReturn> DICETcatProtocol::ApplyClockIdle
     ClockWriteScope clockWrite(clockWriteBusy_);
     if (!clockWrite.acquired) return std::unexpected(kIOReturnBusy);
     ++controlObservation_; // invalidate health reads begun before this clock transaction
-    auto source = ClockSource::Internal;
-    if (runtimePolicy_.clockSourceControl) {
-        const auto global = deviceIo_.ReadGlobalStateFull(sections_);
-        if (!global) return std::unexpected(global.error());
-        source = static_cast<ClockSource>(global->clockSelect & ClockSelect::kSourceMask);
-    }
     DiceClockConfiguration diceClock{};
-    if (!MakeDiceClockConfiguration(clock, diceClock, source)) {
+    if (!MakeDiceClockConfiguration(clock, diceClock)) {
         return std::unexpected(kIOReturnUnsupported);
     }
 
@@ -1178,7 +1166,7 @@ void DICETcatProtocol::ReadDuplexHealth(HealthCallback callback) {
         auto observe = driver_ ? driver_->ReceiverLockObserver()
                                : std::function<void(IOReturn, uint32_t, uint32_t)>{};
         const auto route = io_.Route();
-        const auto observation = runtimePolicy_.clockSourceControl && !clockWriteBusy_.test()
+        const auto observation = !clockWriteBusy_.test()
             ? ++controlObservation_ : 0;
         diceReader_.ReadGlobalState(
             sections_,
@@ -1203,12 +1191,11 @@ void DICETcatProtocol::ReadDuplexHealth(HealthCallback callback) {
                              .generation = busInfo_.GetGeneration(),
                              .appliedClock =
                                  AudioClockConfig{
-                                     .sampleRateHz = DiceConfiguredRate(global.sampleRate, global.status, global.clockSelect, runtimePolicy_.clockSourceControl),
+                                     .sampleRateHz = DiceConfiguredRate(global.sampleRate, global.status, global.clockSelect),
                                  },
                              .runtimeCaps = caps,
                              .sourceLocked = IsSourceLocked(global.status),
                              .clockReferenceHealthy = clockReferenceHealthy,
-                             .canStreamWithoutSourceLock = IsExternalClockSelection(global.clockSelect, runtimePolicy_.clockSourceControl),
                              .nominalRateHz = NominalRateHz(global.status),
                              .notification = global.notification,
                              .status = global.status,
@@ -1295,7 +1282,7 @@ void DICETcatProtocol::EnsureRuntimeCapsLoaded(VoidCallback callback) {
 
         auto state = std::make_shared<RuntimeCapsState>();
         const auto route = io_.Route();
-        const auto observation = runtimePolicy_.clockSourceControl ? ++controlObservation_ : 0;
+        const auto observation = ++controlObservation_;
         diceReader_.ReadGlobalState(
             sections_,
             [this, route, observation, state, callback = std::move(callback)](IOReturn globalStatus, GlobalState global) mutable {
@@ -1383,7 +1370,7 @@ void DICETcatProtocol::CacheRuntimeCaps(const GlobalState& global,
                                         const StreamConfig& tx,
                                         const StreamConfig& rx) noexcept {
     const auto caps = MakeDiceRuntimeCaps(global, tx, rx,
-        runtimePolicy_.exposeDeviceToHostToCoreAudio, runtimePolicy_.clockSourceControl);
+        runtimePolicy_.exposeDeviceToHostToCoreAudio);
 
     // Per-channel device labels from the DICE TX/RX name sections, flattened
     // across streams in channel order. Written BEFORE CacheRuntimeCaps(caps)'s

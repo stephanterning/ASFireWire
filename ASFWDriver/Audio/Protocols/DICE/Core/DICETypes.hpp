@@ -626,15 +626,20 @@ inline constexpr uint32_t kDiceRateCapsMask = 0x7F;
 // telemetry instead of an admission gate.
 class DiceClockChangeObserver;
 
-[[nodiscard]] inline bool IsExternalClockSelection(uint32_t selection, bool allowExternal) noexcept {
-    return allowExternal && (selection & ClockSelect::kSourceMask) == static_cast<uint32_t>(ClockSource::ADAT);
+// The first TCAT clock-control increment supports Internal and ADAT. Other
+// source types require their own admission/clock validation before selection.
+[[nodiscard]] constexpr bool IsSupportedDiceClockSource(uint32_t source) noexcept {
+    return source == static_cast<uint32_t>(ClockSource::Internal) ||
+           source == static_cast<uint32_t>(ClockSource::ADAT);
 }
 
-// Linux dice-transaction.c:75-93 uses CLOCK_SELECT for the PCM rate. The
-// external frequency counter can drift, or retain its last value without lock.
+// Linux dice-transaction.c:75-93 reads the PCM rate from CLOCK_SELECT.
+// External frequency counters drift and can retain a stale value without lock.
+// This reports configuration only; the existing stream-start lock gates remain.
 [[nodiscard]] inline uint32_t DiceConfiguredRate(uint32_t measured, uint32_t status,
-                                                uint32_t selection, bool allowExternal) noexcept {
-    if (!IsExternalClockSelection(selection, allowExternal)) return measured;
+                                                uint32_t selection) noexcept {
+    if ((selection & ClockSelect::kSourceMask) == static_cast<uint32_t>(ClockSource::Internal))
+        return measured;
     const auto index = (selection & ClockSelect::kRateMask) >> ClockSelect::kRateShift;
     for (const auto& rate : kDiceRateTable) {
         if (rate.rateIndex == index)
@@ -643,15 +648,12 @@ class DiceClockChangeObserver;
     return 0;
 }
 
-[[nodiscard]] inline bool DiceClockAtRate(uint32_t measured, uint32_t status, uint32_t selection,
-                                         uint32_t rate, bool allowExternal) noexcept {
-    return DiceConfiguredRate(measured, status, selection, allowExternal) == rate &&
-        (NominalRateHz(status) == rate ||
-         (IsExternalClockSelection(selection, allowExternal) && !IsSourceLocked(status)));
+[[nodiscard]] inline bool DiceClockAtRate(uint32_t measured, uint32_t status,
+                                         uint32_t selection, uint32_t rate) noexcept {
+    return DiceConfiguredRate(measured, status, selection) == rate && NominalRateHz(status) == rate;
 }
 
 struct DICEBringupPolicy final {
-    bool allowExternalClock{false};
     bool requireSourceLockBeforeStreamEnable{true};
     bool requireSourceLockAtConfirm{true};
 
@@ -664,6 +666,8 @@ struct DICEBringupPolicy final {
     bool verifiedLoaderPeek{false};
 };
 
+// Requested rate encoding. DiceFamilyDriver preserves the source observed
+// before claiming the device; source selection belongs to Device Controls.
 struct DiceClockConfiguration {
     uint32_t sampleRateHz{0};
     uint32_t clockSelect{0};
@@ -673,16 +677,16 @@ constexpr uint32_t kDiceClockSelect48kInternal =
     (ClockRateIndex::k48000 << ClockSelect::kRateShift) |
     static_cast<uint32_t>(ClockSource::Internal);
 
-/// A configuration is supported when the source is enabled, the rate is in the standard table and
+/// A configuration is supported when the source is supported, the rate is in
+/// the standard table and
 /// within the HW-validated ceiling, and the CLOCK_SELECT rate index encodes
 /// that same rate. Generalizes the former 48k-internal-only placeholder.
 [[nodiscard]] inline bool IsSupportedDiceClockConfiguration(
-    const DiceClockConfiguration& clock, bool allowMultirate = false, bool allowExternal = false) noexcept {
+    const DiceClockConfiguration& clock, bool allowMultirate = false) noexcept {
     if (!allowMultirate && !DiceRateIsStreamable(clock.sampleRateHz)) {
         return false;
     }
-    if ((clock.clockSelect & ClockSelect::kSourceMask) !=
-        static_cast<uint32_t>(ClockSource::Internal) && !IsExternalClockSelection(clock.clockSelect, allowExternal)) {
+    if (!IsSupportedDiceClockSource(clock.clockSelect & ClockSelect::kSourceMask)) {
         return false;
     }
     for (const auto& e : kDiceRateTable) {

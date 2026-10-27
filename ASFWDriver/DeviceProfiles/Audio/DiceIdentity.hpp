@@ -63,10 +63,4 @@ inline constexpr uint32_t kHarmanDiceOui = 0x000fd7;
            (guidLo >> 22U) == *modelId;
 }
 
-// Captured ZED-R16 GUID: A&H OUI 0x0004c4, standard DICE category, product 0.
-// Product/category fields use the same layout as IsDiceIdentity above.
-[[nodiscard]] constexpr bool IsZedR16(uint64_t guid) noexcept {
-    return (guid >> 32U) == 0x0004c404U && (static_cast<uint32_t>(guid) >> 22U) == 0;
-}
-
 } // namespace ASFW::DeviceProfiles::Audio

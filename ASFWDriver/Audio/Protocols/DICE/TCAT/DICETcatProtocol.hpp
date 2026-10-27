@@ -42,8 +42,6 @@ struct DiceStartupMixerCell final {
 };
 
 struct DICETcatRuntimePolicy final {
-    // Opt in only for hardware with verified Internal/ADAT behavior.
-    bool clockSourceControl{false};
     bool exposeDeviceToHostToCoreAudio{true};
     // Receiver-register dumps through the firmware loader's PEEK. Set only by
     // a protocol whose firmware TEST_ACTION table was verified (DICEBringupPolicy).
@@ -122,7 +120,7 @@ public:
     const char* GetName() const override { return "TCAT DICE"; }
     Audio::FamilyDriver* AsFamilyDriver() noexcept override { return this; }
     Controls::IControlProvider* Controls() noexcept override {
-        return runtimePolicy_.clockSourceControl ? this : nullptr;
+        return this;
     }
 
     bool GetRuntimeAudioStreamCaps(AudioStreamRuntimeCaps& outCaps) const override;
@@ -219,7 +217,7 @@ private:
 
     [[nodiscard]] static bool MakeDiceClockConfiguration(
         const AudioClockConfig& requested,
-        DiceClockConfiguration& out, ClockSource source = ClockSource::Internal) noexcept;
+        DiceClockConfiguration& out) noexcept;
     void EnsureSectionsLoaded(VoidCallback callback);
     void EnsureRuntimeCapsLoaded(VoidCallback callback);
     struct InitialClockPreparation;

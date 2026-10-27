@@ -639,9 +639,8 @@ IOReturn RestartRoutine::AwaitStableClock(FamilyDriver& family, FW::Generation g
             return kIOReturnOffline;
         }
 
-        const bool lockedAtTarget = (health->sourceLocked || health->canStreamWithoutSourceLock) &&
-                                    (health->nominalRateHz == clock.sampleRateHz ||
-                                     (!health->sourceLocked && health->canStreamWithoutSourceLock)) &&
+        const bool lockedAtTarget = health->sourceLocked &&
+                                    health->nominalRateHz == clock.sampleRateHz &&
                                     health->appliedClock.sampleRateHz == clock.sampleRateHz;
         lockedReads = lockedAtTarget ? lockedReads + 1 : 0;
         if (lockedReads >= kClockStableReads) {

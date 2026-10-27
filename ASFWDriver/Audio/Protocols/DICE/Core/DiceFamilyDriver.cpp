@@ -58,12 +58,12 @@ void ResetSession(DuplexRestartSession& session) noexcept {
 void CacheRuntimeCaps(AudioStreamRuntimeCaps& caps,
                       const GlobalState& global,
                       const StreamConfig& tx,
-                      const StreamConfig& rx, bool allowExternal) noexcept {
+                      const StreamConfig& rx) noexcept {
     caps.hostInputPcmChannels = tx.TotalPcmChannels();
     caps.deviceToHostAm824Slots = tx.TotalAm824Slots();
     caps.hostOutputPcmChannels = rx.TotalPcmChannels();
     caps.hostToDeviceAm824Slots = rx.TotalAm824Slots();
-    caps.sampleRateHz = DiceConfiguredRate(global.sampleRate, global.status, global.clockSelect, allowExternal);
+    caps.sampleRateHz = DiceConfiguredRate(global.sampleRate, global.status, global.clockSelect);
     caps.deviceRateMask = DiceDeviceRateMask(global.hasClockCaps, global.clockCaps);
     caps.deviceToHostIsoChannel =
         tx.FirstActiveIsoChannel(AudioStreamRuntimeCaps::kInvalidIsoChannel);
@@ -129,7 +129,7 @@ std::expected<DuplexPrepareResult, IOReturn> DiceFamilyDriver::Prepare(
     if (!busInfo_.GetLocalNodeID().IsValid()) {
         return std::unexpected(kIOReturnNotReady);
     }
-    if (!IsSupportedDiceClockConfiguration(clock, Runtime::kDiceHardwareBatch, bringupPolicy_.allowExternalClock)) {
+    if (!IsSupportedDiceClockConfiguration(clock, Runtime::kDiceHardwareBatch)) {
         return std::unexpected(kIOReturnUnsupported);
     }
     if (HasDeviceRestartState(session_)) {
@@ -252,8 +252,7 @@ std::expected<DuplexConfirmResult, IOReturn> DiceFamilyDriver::Confirm() {
         }
 
         const bool sourceLocked = IsSourceLocked(*status);
-        if (sourceLocked || !bringupPolicy_.requireSourceLockAtConfirm ||
-            IsExternalClockSelection(diceClock_.clockSelect, bringupPolicy_.allowExternalClock)) {
+        if (sourceLocked || !bringupPolicy_.requireSourceLockAtConfirm) {
             if (!sourceLocked) {
                 ASFW_LOG(DICE,
                          "ConfirmDuplex48kStart: proceeding with advisory source lock "
@@ -293,7 +292,7 @@ std::expected<DuplexConfirmResult, IOReturn> DiceFamilyDriver::Confirm() {
 
 std::expected<DuplexClockApplyResult, IOReturn> DiceFamilyDriver::ApplyClock(
     const DiceClockConfiguration& clock) {
-    if (!IsSupportedDiceClockConfiguration(clock, Runtime::kDiceHardwareBatch, bringupPolicy_.allowExternalClock)) {
+    if (!IsSupportedDiceClockConfiguration(clock, Runtime::kDiceHardwareBatch)) {
         return std::unexpected(kIOReturnUnsupported);
     }
     if (!busInfo_.GetLocalNodeID().IsValid()) {
@@ -382,6 +381,11 @@ IOReturn DiceFamilyDriver::ClaimAndClock(const AudioDuplexChannels& channels) {
                  preClaim->version);
         return Rollback(kIOReturnUnsupported);
     }
+    // Rate changes preserve the live source (Linux dice-stream.c:60-85).
+    // Reuse this pre-claim read instead of adding a second GLOBAL transaction.
+    const auto source = preClaim->clockSelect & ClockSelect::kSourceMask;
+    if (!IsSupportedDiceClockSource(source)) return Rollback(kIOReturnUnsupported);
+    diceClock_.clockSelect = (diceClock_.clockSelect & ~ClockSelect::kSourceMask) | source;
     preClaimClockSelect_ = preClaim->clockSelect;
     preClaimStatus_ = preClaim->status;
     preClaimSampleRate_ = preClaim->sampleRate;
@@ -483,7 +487,7 @@ IOReturn DiceFamilyDriver::WriteClockSelect(const AudioDuplexChannels& channels)
     const uint32_t targetHz = session_.desiredClock.sampleRateHz;
     const bool requestedAtTarget = preClaimClockSelect_ == diceClock_.clockSelect;
     const bool achievedAtTarget =
-        DiceClockAtRate(preClaimSampleRate_, preClaimStatus_, preClaimClockSelect_, targetHz, bringupPolicy_.allowExternalClock);
+        DiceClockAtRate(preClaimSampleRate_, preClaimStatus_, preClaimClockSelect_, targetHz);
     if (flowMode_ == FlowMode::kClockApply && requestedAtTarget && achievedAtTarget) {
         ASFW_LOG(DICE,
                  "ApplyClock: device already at target clockSelect=0x%08x rate=%u; skipping redundant write",
@@ -566,7 +570,7 @@ IOReturn DiceFamilyDriver::ActiveClockCheck(const AudioDuplexChannels& channels,
     const bool sourceLockedAtTarget =
         IsSourceLocked(state->status) &&
         NominalRateHz(state->status) == session_.desiredClock.sampleRateHz;
-    const bool sampleRateAtTarget = DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect, bringupPolicy_.allowExternalClock) == session_.desiredClock.sampleRateHz;
+    const bool sampleRateAtTarget = DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect) == session_.desiredClock.sampleRateHz;
 
     if (clockAccepted || (sourceLockedAtTarget && sampleRateAtTarget)) {
         ASFW_LOG(DICE,
@@ -640,7 +644,7 @@ IOReturn DiceFamilyDriver::ReadGlobalAfterClockAccepted(const AudioDuplexChannel
     const bool sourceLockedAtTarget =
         IsSourceLocked(state->status) &&
         NominalRateHz(state->status) == session_.desiredClock.sampleRateHz;
-    const bool sampleRateAtTarget = DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect, bringupPolicy_.allowExternalClock) == session_.desiredClock.sampleRateHz;
+    const bool sampleRateAtTarget = DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect) == session_.desiredClock.sampleRateHz;
 
     if (state->clockSelect != diceClock_.clockSelect) {
         ASFW_LOG(DICE,
@@ -648,9 +652,7 @@ IOReturn DiceFamilyDriver::ReadGlobalAfterClockAccepted(const AudioDuplexChannel
                  state->clockSelect, combinedNotify, state->status, state->sampleRate);
         return Rollback(failureStatus);
     }
-    if (!clockAccepted && !(sourceLockedAtTarget && sampleRateAtTarget) &&
-        !(IsExternalClockSelection(state->clockSelect, bringupPolicy_.allowExternalClock) &&
-          !IsSourceLocked(state->status) && sampleRateAtTarget)) {
+    if (!clockAccepted && !(sourceLockedAtTarget && sampleRateAtTarget)) {
         ASFW_LOG(DICE,
                  "PrepareDuplex48k: CLOCK_ACCEPTED not confirmed, notify=0x%08x status=0x%08x sampleRate=%u",
                  combinedNotify, state->status, state->sampleRate);
@@ -701,7 +703,7 @@ IOReturn DiceFamilyDriver::AwaitReconfigurationRelock(uint32_t observedNotify) {
         const bool lockChangedDuringRead = (lateNotify & Notify::kLockChange) != 0;
         const bool lockedAtTarget = IsSourceLocked(state->status) &&
                                     NominalRateHz(state->status) == targetHz &&
-                                    DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect, bringupPolicy_.allowExternalClock) == targetHz;
+                                    DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect) == targetHz;
         const uint64_t waitedMs = io_.Clock().NowMs() - startMs;
         if (lockChanged && lockedAtTarget && !lockChangedDuringRead) {
             ASFW_LOG(DICE, "PrepareDuplex48k: device reconfigured and relocked at %u Hz after %llu ms",
@@ -743,9 +745,8 @@ IOReturn DiceFamilyDriver::AwaitIdleClockRate() {
         const auto state = io_.ReadGlobalStateFull(sections_);
         if (!state) return Rollback(state.error());
         const uint32_t targetHz = session_.desiredClock.sampleRateHz;
-        if (DiceClockAtRate(state->sampleRate, state->status, state->clockSelect, targetHz, bringupPolicy_.allowExternalClock) &&
-            (!bringupPolicy_.requireSourceLockBeforeStreamEnable || IsSourceLocked(state->status) ||
-             IsExternalClockSelection(state->clockSelect, bringupPolicy_.allowExternalClock))) {
+        if (NominalRateHz(state->status) == targetHz && DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect) == targetHz &&
+            (!bringupPolicy_.requireSourceLockBeforeStreamEnable || IsSourceLocked(state->status))) {
             if (attempt > 0) {
                 ASFW_LOG(DICE, "ApplyClock: prepared %u Hz after %u ms", targetHz,
                          attempt * kPollIntervalMs);
@@ -779,12 +780,11 @@ IOReturn DiceFamilyDriver::AwaitStreamingClockLock(const AudioDuplexChannels& ch
         }
 
         const bool rateAtTarget =
-            DiceClockAtRate(state->sampleRate, state->status, state->clockSelect,
-                            session_.desiredClock.sampleRateHz, bringupPolicy_.allowExternalClock);
+            NominalRateHz(state->status) == session_.desiredClock.sampleRateHz &&
+            DiceConfiguredRate(state->sampleRate, state->status, state->clockSelect) == session_.desiredClock.sampleRateHz;
         const bool sourceLocked = IsSourceLocked(state->status);
         const bool readyForEnable =
-            rateAtTarget && (sourceLocked || !bringupPolicy_.requireSourceLockBeforeStreamEnable ||
-                IsExternalClockSelection(state->clockSelect, bringupPolicy_.allowExternalClock));
+            rateAtTarget && (sourceLocked || !bringupPolicy_.requireSourceLockBeforeStreamEnable);
 
         if (readyForEnable) {
             if (attempt > 0) {
@@ -821,7 +821,7 @@ bool DiceFamilyDriver::AfterClockWrite() {
     }
     const uint32_t rateHz = session_.desiredClock.sampleRateHz;
     const bool rateChanged =
-        NominalRateHz(preClaimStatus_) != rateHz || DiceConfiguredRate(preClaimSampleRate_, preClaimStatus_, preClaimClockSelect_, bringupPolicy_.allowExternalClock) != rateHz;
+        NominalRateHz(preClaimStatus_) != rateHz || DiceConfiguredRate(preClaimSampleRate_, preClaimStatus_, preClaimClockSelect_) != rateHz;
     bringupPolicy_.clockChangeObserver->AfterClockChange(io_, rateHz, rateChanged);
     return !TeardownRequested() && EnsureRouteCurrent();
 }
@@ -908,7 +908,7 @@ IOReturn DiceFamilyDriver::RefreshRuntimeCaps() {
     if (!rx) {
         return rx.error();
     }
-    CacheRuntimeCaps(runtimeCaps_, *global, *tx, *rx, bringupPolicy_.allowExternalClock);
+    CacheRuntimeCaps(runtimeCaps_, *global, *tx, *rx);
     session_.runtimeCaps = runtimeCaps_;
     session_.appliedClock = AudioClockConfig{.sampleRateHz = runtimeCaps_.sampleRateHz};
     return kIOReturnSuccess;

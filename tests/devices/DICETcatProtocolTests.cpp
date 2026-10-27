@@ -502,6 +502,7 @@ TEST(DICETcatProtocolTests, RuntimeCapsAggregateTotalConfiguredStreams) {
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
 
     ASFW::Audio::DICE::StreamConfig tx{};
     tx.numStreams = 2;
@@ -546,6 +547,7 @@ TEST(DICETcatProtocolTests, RuntimePolicyHidesCoreAudioInputWithoutChangingWireG
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
     ASFW::Audio::DICE::StreamConfig tx{};
     tx.numStreams = 1;
     tx.streams[0].isoChannel = 0;
@@ -590,6 +592,7 @@ TEST(DICETcatProtocolTests, ChannelLabelsFlattenAcrossStreamsInChannelOrder) {
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
 
     // Host input == device TX; two streams, names concatenated in stream order.
     ASFW::Audio::DICE::StreamConfig tx{};
@@ -624,6 +627,7 @@ TEST(DICETcatProtocolTests, RefusesAnUnknownClockRateWithoutBusTraffic) {
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
     global.clockCaps = 0x13000006;
     global.hasClockCaps = true;
     ASFW::Audio::DICE::StreamConfig tx{};
@@ -667,6 +671,7 @@ TEST(DICETcatProtocolTests, RefusesAnAnnouncedHighRateWithoutBusTraffic) {
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
     global.clockCaps = 0x112C001E;  // 44.1/48/88.2/96 kHz, the recorded Pro 24 DSP
     global.hasClockCaps = true;
     ASFW::Audio::DICE::StreamConfig tx{};
@@ -704,6 +709,7 @@ TEST(DICETcatProtocolTests, ReadDuplexHealthReturnsCurrentGlobalLockState) {
 
     ASFW::Audio::DICE::GlobalState global{};
     global.sampleRate = 48000;
+    global.clockSelect = kClockSelect48kInternal;
 
     ASFW::Audio::DICE::StreamConfig tx{};
     tx.numStreams = 1;
@@ -984,8 +990,7 @@ class DiceClockControlTests : public ::testing::Test {
 protected:
     CountingFireWireBus bus;
     RouteState route;
-    DICETcatProtocol protocol{bus, bus, route.registry, route.route, nullptr, WaitClock(), nullptr,
-        {.clockSourceControl = true}};
+    DICETcatProtocol protocol{bus, bus, route.registry, route.route, nullptr, WaitClock(), nullptr};
     void SetUp() override {
         ASSERT_EQ(protocol.Initialize(), kIOReturnSuccess);
         ASSERT_EQ(protocol.LoadGeometry(), kIOReturnSuccess);
@@ -1088,10 +1093,18 @@ TEST_F(DiceClockControlTests, ShutdownDuringWriteDoesNotPublishOrDereferenceReti
     EXPECT_EQ(result, kIOReturnAborted);
 }
 
-TEST_F(DiceClockControlTests, OtherDevicesDoNotAcquireTheNewControl) {
-    DICETcatProtocol other(bus, bus, route.registry, route.route, nullptr, WaitClock(), nullptr);
-    EXPECT_EQ(other.Controls(), nullptr);
+TEST_F(DiceClockControlTests, GenericTcatUsesAdvertisedSourcesWithoutAProductPolicy) {
+    // RouteState deliberately uses a non-ZED GUID and the default TCAT policy.
+    EXPECT_NE(route.route.guid, 0x0004c404000186a1ULL);
+    const auto snapshot = *protocol.Controls()->CopySnapshot();
+    const auto& choices = std::get<ASFW::AudioModel::EnumDomain>(snapshot.topology.parameters.front().domain).values;
+    ASSERT_EQ(choices.size(), 2U);
+    EXPECT_EQ(choices[0].name, "Internal");
+    EXPECT_EQ(choices[1].name, "ADAT");
     const auto writes = bus.writeCount;
+    // A capability bit alone does not enable unimplemented source types.
+    bus.clockCaps |= (1U << (16 + 7)) | (1U << (16 + 9));
+    EXPECT_EQ(Select(7), kIOReturnBadArgument);
     EXPECT_EQ(Select(9), kIOReturnBadArgument);
     EXPECT_EQ(bus.writeCount, writes);
 }
@@ -1102,7 +1115,7 @@ TEST_F(DiceClockControlTests, ReconnectPreservesAdatAndConfiguredRateWithStaleMe
     bus.sampleRate_ = 96093;
     std::optional<IOReturn> prepared;
     protocol.EnsureRuntimeStreamGeometry([&](auto status) { prepared = status; });
-    static_cast<ASFW::Testing::FakeTimerScheduler*>(WaitClock().Scheduler())->Advance(550'000'000ULL);
+    static_cast<ASFW::Testing::FakeTimerScheduler*>(WaitClock().Scheduler())->Advance(3'500'000'000ULL);
     ASSERT_EQ(prepared, kIOReturnSuccess);
     EXPECT_EQ(bus.clockSelect_, 0x205U);
     EXPECT_EQ(Selected(), 5);
@@ -1112,7 +1125,7 @@ TEST_F(DiceClockControlTests, ReconnectPreservesAdatAndConfiguredRateWithStaleMe
     bool observed = false;
     protocol.ReadRateObservation([&](auto status, auto observation) {
         EXPECT_EQ(status, kIOReturnSuccess);
-        EXPECT_TRUE(observation.clockConfirmed);
+        EXPECT_FALSE(observation.clockConfirmed);
         EXPECT_EQ(observation.caps.sampleRateHz, 48000U);
         observed = true;
     });
